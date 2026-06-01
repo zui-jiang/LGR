@@ -1,0 +1,6 @@
+[submodule "slime_tree"]
+	path = slime_tree
+	url = https://github.com/zui-jiang/slime_tree.git
+[submodule "sg_tree"]
+	path = sg_tree
+	url = https://github.com/zui-jiang/sg_tree.git

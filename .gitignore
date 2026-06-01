@@ -1,0 +1,36 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# macOS and editor files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime outputs
+.cache/
+logs/
+shell/logs/
+shell/checkpoint/
+checkpoint/
+checkpoints/
+dump/
+outputs/
+wandb/
+*.log
+*.tmp
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
