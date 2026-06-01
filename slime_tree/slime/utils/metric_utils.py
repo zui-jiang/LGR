@@ -27,15 +27,33 @@ def compute_pass_rate(
     assert len(flat_rewards) == num_groups * group_size, f"{len(flat_rewards)=} {num_groups=} {group_size=}"
     rewards_of_group = np.array(flat_rewards).reshape(num_groups, group_size)
 
-    log_dict = {}
-    for k in pass_rate_name_list:
-        num_correct = np.sum(rewards_of_group == 1, axis=1)
-        num_samples = np.full(num_groups, group_size)
+    num_correct = np.sum(rewards_of_group == 1, axis=1)
+    num_samples = np.full(num_groups, group_size)
 
+    log_dict = {}
+
+    for k in pass_rate_name_list:
         pass_k_estimates = _estimate_pass_at_k(num_samples, num_correct, k)
 
-        pass_k = np.mean(pass_k_estimates)
-        log_dict[f"pass@{k}"] = pass_k
+        log_dict[f"pass@{k}"] = np.mean(pass_k_estimates).item()
+
+        if len(pass_k_estimates) > 1:
+            log_dict[f"pass@{k}_std"] = np.std(pass_k_estimates).item()
+            log_dict[f"pass@{k}_min"] = np.min(pass_k_estimates).item()
+            log_dict[f"pass@{k}_max"] = np.max(pass_k_estimates).item()
+
+    for correct_count in range(group_size + 1):
+        count = np.sum(num_correct == correct_count)
+        ratio = count / num_groups if num_groups > 0 else 0.0
+        log_dict[f"correct_dist/num_{correct_count}"] = count
+        log_dict[f"correct_dist/ratio_{correct_count}"] = ratio
+
+
+    log_dict["correct_dist/mean"] = np.mean(num_correct).item()
+    log_dict["correct_dist/std"] = np.std(num_correct).item()
+
+    log_dict["correct_dist/all_fail_ratio"] = (np.sum(num_correct == 0) / num_groups).item()
+    log_dict["correct_dist/all_pass_ratio"] = (np.sum(num_correct == group_size) / num_groups).item()
 
     return log_dict
 

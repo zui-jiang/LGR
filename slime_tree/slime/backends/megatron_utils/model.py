@@ -27,8 +27,9 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
+from .initialize import is_megatron_main_rank
 from .loss import loss_function
-from .model_provider import get_model_provider_func
+from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +106,24 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+    model = get_model(
+        wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
+    )
 
     # Optimizer
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
+    if args.fp16:
+        kwargs["bf16"] = False
+        kwargs["fp16"] = True
+        kwargs["params_dtype"] = torch.float16
+        kwargs["initial_loss_scale"] = 32768
+        kwargs["min_loss_scale"] = 1
+        kwargs["use_precision_aware_optimizer"] = True
+        kwargs["store_param_remainders"] = False
+        logger.info(f"FP16 mode enabled. Optimizer config: {kwargs}")
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
@@ -155,6 +167,7 @@ def forward_only(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     store_prefix: str = "",
+    with_topk: bool = False,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -238,6 +251,7 @@ def forward_only(
             total_lengths=total_lengths,
             response_lengths=response_lengths,
             with_entropy=args.use_rollout_entropy,
+            with_topk=with_topk,
             max_seq_lens=batch.get("max_seq_lens", None),
         )
 
@@ -257,7 +271,6 @@ def forward_only(
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
     for step_id in range(num_steps_per_rollout):
-        # collect_non_loss_data
         forward_data_store += forward_backward_func(
             forward_step_func=forward_step,
             data_iterator=data_iterator,
@@ -266,7 +279,6 @@ def forward_only(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
-            collect_non_loss_data=True,
         )
 
     # Move model back to the train mode.
@@ -325,6 +337,13 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    args.current_global_step = rollout_id * args.num_steps_per_rollout + step_id
+
+    # Log training progress (only on main rank to avoid duplicate logs)
+    if is_megatron_main_rank():
+        current_step = rollout_id * args.num_steps_per_rollout + step_id + 1
+        total_steps = args.num_rollout * args.num_steps_per_rollout
+        logging.info(f"[Train] Step {current_step}/{total_steps}")
 
     # Set grad to zero.
     for model_chunk in model:
@@ -370,6 +389,13 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "max_seq_lens",
+                "teacher_log_probs",
+                "teacher_logit_y",
+                "teacher_sampled_tokens",
+                "teacher_dist_topk_tokens",
+                "teacher_dist_topk_log_probs",
+                "teacher_next_token_confidence",
+                "teacher_next_token_candidates",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -426,7 +452,7 @@ def train_one_step(
     )
 
     valid_step = True
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+    if not getattr(args, "check_for_nan_in_loss_and_grad", True) and not args.fp16:
         found_inf_flag = optimizer.prepare_grads()
         if found_inf_flag:
             valid_step = False
@@ -470,10 +496,25 @@ def train_one_step(
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
         loss_reduced = {}
+        raw_sums = {}
         values = values.tolist()
         num_samples_or_tokens = values[0]
         for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+            if key.endswith("__raw"):
+                # Raw counters: store the global sum directly (not averaged by num_samples).
+                raw_sums[key] = value * mpu.get_context_parallel_world_size()
+            else:
+                loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+
+        # Derive global ratios from paired raw counters.
+        # Convention: "foo_applied_count__raw" / "foo_total_count__raw" -> "foo_applied_ratio"
+        for key, val in list(raw_sums.items()):
+            if key.endswith("_applied_count__raw"):
+                prefix = key[: -len("_applied_count__raw")]
+                total_key = f"{prefix}_total_count__raw"
+                if total_key in raw_sums and raw_sums[total_key] > 0:
+                    loss_reduced[f"{prefix}_applied_ratio"] = val / raw_sums[total_key]
+
         return loss_reduced, grad_norm
     return {}, grad_norm
 
@@ -481,16 +522,6 @@ def train_one_step(
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather
-
-
-def finalize_model_grads_with_empty_cache(*args, **kwargs):
-    # trigger empty cache when there are less than 10% free memory before the final reduce scatter.
-    # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
-    device = torch.cuda.current_device()
-    free, total = torch.cuda.mem_get_info(device)
-    if free / total < 0.1:
-        clear_memory()
-    return finalize_model_grads(*args, **kwargs)
 
 
 def train(
@@ -543,7 +574,7 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+    config.finalize_model_grads_func = finalize_model_grads
 
     pre_hook_enabled = False
 
@@ -559,6 +590,11 @@ def train(
                 if "step" in group:
                     group["step"] = 0
             for state in chained_optimizer.optimizer.state.values():
+                if "step" in state:
+                    if isinstance(state["step"], torch.Tensor):
+                        state["step"].zero_()
+                    else:
+                        state["step"] = 0
                 if "exp_avg" in state:
                     state["exp_avg"].zero_()
                 if "exp_avg_sq" in state:

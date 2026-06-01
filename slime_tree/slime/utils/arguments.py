@@ -174,6 +174,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
+            parser.add_argument(
+                "--only-train-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""List of regex patterns of parameter names to TRAIN. All other parameters will be FROZEN. 
+                        Supports Python regex syntax (re.search).
+
+                        Examples:
+                        1. Train ONLY MoE experts:
+                            --only-train-params-name-list experts
+
+                        2. Train ONLY Indexer parameters:
+                            --only-train-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
+
+                        3. Train ONLY Layer 20 to 23:
+                            --only-train-params-name-list layers\.2[0-3]\.
+                        """,
+            )
+
+            parser.add_argument(
+                "--freeze-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""List of regex patterns of parameter names to FREEZE. Other parameters will remain trainable.
+                        Supports Python regex syntax (re.search).
+
+                        Examples:
+                        1. Freeze Embeddings and Output Layer (common for fine-tuning):
+                            --freeze-params-name-list embedding output_layer
+
+                        2. Freeze Indexer parameters:
+                            --freeze-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
+
+                        3. Freeze specific projection layers (e.g., all Gate/Up projections):
+                            --freeze-params-name-list linear_fc1
+                        """,
+            )
 
             return parser
 
@@ -324,6 +363,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "It should be able to judge whether the result of a prompt should be selected or not."
                     "We will do dynamic filter for sampling as in DAPO. e.g. not all correct or all wrong samples."
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
+                ),
+            )
+
+            # RFT (Rejection Sampling Fine-Tuning)
+            parser.add_argument(
+                "--rft-reward-threshold",
+                type=float,
+                default=0.5,
+                help=(
+                    "Minimum reward threshold for RFT (Rejection Sampling Fine-Tuning). "
+                    "Only samples with reward >= threshold will be kept for training. "
+                    "Default: 0.5. For binary correctness (0 or 1), use 0.5 to keep only correct samples."
+                ),
+            )
+            parser.add_argument(
+                "--rft-min-correct-per-prompt",
+                type=int,
+                default=1,
+                help=(
+                    "Minimum number of correct samples required to keep a prompt group in RFT. "
+                    "If a prompt has fewer correct samples than this, the entire group is discarded. "
+                    "Default: 1 (keep if at least one correct)."
                 ),
             )
 
@@ -780,9 +841,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
-                    "on_policy_distillation",
                 ],
                 default="grpo",
+                help=(
+                    "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
+                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
+                ),
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -920,6 +984,665 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1e-4,
                 help="The threshold for Off-Policy Sequence Masking (OPSM).",
             )
+            parser.add_argument(
+                "--grpo-sample-filter",
+                type=str,
+                choices=["both", "positive", "negative"],
+                default="both",
+                help=(
+                    "Filter GRPO samples by advantage sign. "
+                    "'both': use all samples (default), "
+                    "'positive': only update on samples with advantage > 0, "
+                    "'negative': only update on samples with advantage < 0. "
+                    "Filtering happens after advantage calculation."
+                ),
+            )
+            return parser
+
+        def add_on_policy_distillation_arguments(parser):
+            """Add on-policy distillation (OPD) related arguments.
+
+            OPD is orthogonal to advantage estimators and can be applied on top of
+            any estimator (GRPO, PPO, etc.) by adding a KL penalty to advantages.
+            """
+            parser.add_argument(
+                "--use-opd",
+                action="store_true",
+                default=False,
+                help="Enable on-policy distillation (OPD). Must specify --opd-type when enabled.",
+            )
+            parser.add_argument(
+                "--opd-type",
+                type=str,
+                choices=["sglang", "megatron"],
+                default=None,
+                help=(
+                    "Type of on-policy distillation. "
+                    "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-coef",
+                type=float,
+                default=1.0,
+                help="On-policy distillation KL penalty coefficient. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-use-sign-penalty",
+                action="store_true",
+                help=(
+                    "Enable sign-dependent fixed penalty instead of proportional penalty. "
+                    "Default (False): advantages = adv - coef * gopd_kl (penalty scales with KL). "
+                    "With this flag (True): advantages = adv - fixed_penalty (same penalty for all tokens with same sign). "
+                    "When enabled, --opd-kl-coef-positive/negative/zero become fixed penalty values instead of coefficients."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-coef-positive",
+                type=float,
+                default=None,
+                help=(
+                    "Without --opd-use-sign-penalty: KL penalty coefficient for positive reverse KL (student > teacher). "
+                    "With --opd-use-sign-penalty: Fixed penalty value for positive tokens. "
+                    "If not set, defaults to --opd-kl-coef. "
+                    "Example: --opd-kl-coef-positive 1.5"
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-coef-negative",
+                type=float,
+                default=None,
+                help=(
+                    "Without --opd-use-sign-penalty: KL penalty coefficient for negative reverse KL (student < teacher). "
+                    "With --opd-use-sign-penalty: Fixed penalty value for negative tokens. "
+                    "If not set, defaults to --opd-kl-coef. "
+                    "Example: --opd-kl-coef-negative 0.5"
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-coef-zero",
+                type=float,
+                default=None,
+                help=(
+                    "Without --opd-use-sign-penalty: KL penalty coefficient for zero reverse KL (student == teacher). "
+                    "With --opd-use-sign-penalty: Fixed penalty value for exact matches. "
+                    "If not set, defaults to --opd-kl-coef. "
+                    "Exact matches are rare and usually don't need special handling. "
+                    "Example: --opd-kl-coef-zero 0.0"
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-load",
+                type=str,
+                default=None,
+                help=(
+                    "The checkpoint for OPD teacher model. Required when --opd-type=megatron. "
+                    "The teacher model should have the same architecture as policy/ref model."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            parser.add_argument(
+                "--reopold",
+                action="store_true",
+                default=False,
+                help="Enable REOPOLD (Relaxed On-Policy Distillation). Requires --use-opd.",
+            )
+            parser.add_argument(
+                "--reopold-lambda",
+                type=float,
+                default=0.3,
+                help="REOPOLD mixture coefficient λ. Clip threshold = log(λ/(1-λ)). Default 0.3.",
+            )
+            parser.add_argument(
+                "--reopold-entropy-beta",
+                type=float,
+                default=0.2,
+                help="REOPOLD entropy percentile β. Top-β fraction of tokens get gradient in Phase II. Default 0.2.",
+            )
+            parser.add_argument(
+                "--reopold-switch-step",
+                type=int,
+                default=None,
+                help="T_switch: Phase I→II transition step. Defaults to num_rollout // 3.",
+            )
+            parser.add_argument(
+                "--opd-kl-filter-mode",
+                type=str,
+                choices=["threshold", "quantile"],
+                default="threshold",
+                help=(
+                    "Mode for OPD KL-based loss mask filtering. "
+                    "'threshold': Use fixed thresholds (--opd-kl-threshold-high/low). "
+                    "'quantile': Use dynamic quantile-based thresholds (--opd-kl-quantile-high/low). "
+                    "Default is 'threshold'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-threshold-high",
+                type=float,
+                default=None,
+                help=(
+                    "Upper threshold for KL filtering. Keeps tokens with KL <= threshold_high. "
+                    "Used with --opd-kl-filter-mode threshold. Default is None (no upper limit)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-threshold-low",
+                type=float,
+                default=None,
+                help=(
+                    "Lower threshold for KL filtering. Keeps tokens with KL >= threshold_low. "
+                    "Used with --opd-kl-filter-mode threshold. Default is None (no lower limit)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-quantile-high",
+                type=float,
+                default=None,
+                help=(
+                    "Upper quantile for KL filtering (e.g., 0.8 to filter top 20% high KL). "
+                    "Used with --opd-kl-filter-mode quantile. Default is None."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-quantile-low",
+                type=float,
+                default=None,
+                help=(
+                    "Lower quantile for KL filtering (e.g., 0.2 to filter bottom 20% low KL). "
+                    "Used with --opd-kl-filter-mode quantile. Default is None."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-filter-invert",
+                action="store_true",
+                help=(
+                    "Invert KL filter logic: keep tokens outside thresholds instead of inside. "
+                    "Default (False): keep threshold_low <= KL <= threshold_high. "
+                    "With this flag (True): keep KL < threshold_low or KL > threshold_high."
+                ),
+            )
+
+            # G-OPD (Generalized On-Policy Distillation) arguments
+            parser.add_argument(
+                "--opd-lambda",
+                type=float,
+                default=1.0,
+                help=(
+                    "G-OPD reward scaling factor (λ). "
+                    "λ = 1.0: Standard OPD (default). "
+                    "0 < λ < 1: Reward interpolation. "
+                    "λ > 1: Reward extrapolation (ExOPD, paper recommends 1.25). "
+                    "Reference: arXiv:2602.12125v1"
+                ),
+            )
+            parser.add_argument(
+                "--opd-filter-transform",
+                type=str,
+                choices=["identity", "exp"],
+                default="identity",
+                help=("Mode for OPD KL filter"),
+            )
+            parser.add_argument(
+                "--opd-use-reward-correction",
+                action="store_true",
+                help=(
+                    "Enable reward correction for strong-to-weak distillation. "
+                    "Uses teacher base model as reference instead of student ref model. "
+                    "Requires --teacher-base-model-name and extra inference cost."
+                ),
+            )
+            parser.add_argument(
+                "--opd-use-orm",
+                action="store_true",
+                help=(
+                    "Enable Outcome Reward Model (ORM) for task-level rewards. "
+                    "If disabled (default), pure distillation with zero task rewards. "
+                    "If enabled, combines ORM rewards (--rm-type) with teacher distillation."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-base-model-name",
+                type=str,
+                default=None,
+                help=(
+                    "Teacher's base model name (before RL) for reward correction. "
+                    "Used with --opd-use-reward-correction. "
+                    "Queried via same --rm-url with model parameter."
+                ),
+            )
+            # TopK OPD arguments
+            parser.add_argument(
+                "--opd-use-topk",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable TopK mode for on-policy distillation. "
+                    "Uses topk candidate tokens for more accurate KL estimation with weighted sum: "
+                    "KL ≈ Σ_i p_student(token_i) * [log p_student(token_i) - log p_teacher(token_i)]. "
+                    "This provides better KL approximation than single sampled token."
+                ),
+            )
+            parser.add_argument(
+                "--opd-topk-size",
+                type=int,
+                default=10,
+                help=(
+                    "Number of top-k tokens to use for TopK OPD mode. "
+                    "Only used when --opd-use-topk is enabled. "
+                    "Default is 10. Typical values: 5-20."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-topk-kl",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable teacher-topk driven KL distillation loss (computed during training forward pass). "
+                    "Teacher's own top-k tokens define the token set; student log probs are gathered from "
+                    "training logits with full gradient support and vocab-parallel awareness. "
+                    "If the student's sampled token is not in the teacher's top-k, it replaces the last entry."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-topk-kl-type",
+                type=str,
+                default="backward",
+                choices=["forward", "backward", "jsd"],
+                help=(
+                    "KL divergence type for teacher-topk KL loss. "
+                    "'backward': KL(teacher || student) = Σ p_t * (log p_t - log p_s), student gets gradient. "
+                    "'forward': KL(student || teacher) = Σ p_s * (log p_s - log p_t), student gets gradient. "
+                    "'jsd': Jensen-Shannon divergence = 0.5*(KL(p_t||m) + KL(p_s||m)) where m=(p_t+p_s)/2. "
+                    "Default is 'backward'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-topk-kl-coef",
+                type=float,
+                default=1.0,
+                help="Loss coefficient for teacher-topk KL distillation loss. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-teacher-topk-jsd-beta",
+                type=float,
+                default=0.5,
+                help=(
+                    "Mixture weight for JSD when --opd-teacher-topk-kl-type=jsd. "
+                    "The mixture distribution is m = beta * p_student + (1-beta) * p_teacher. "
+                    "JSD = (1-beta) * KL(p_t || m) + beta * KL(p_s || m). "
+                    "Default is 0.5 (standard symmetric JSD). "
+                    "Values < 0.5 put more weight on teacher side; > 0.5 on student side."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-topk-size",
+                type=int,
+                default=50,
+                help=(
+                    "Number of top-k logprobs to request from the teacher. "
+                    "Used for teacher-topk KL loss (--opd-teacher-topk-kl), "
+                    "teacher_logit_y collection, RC-OPD, and confidence reward (max_logp/entropy). Default is 50."
+                ),
+            )
+            # Union TopK KL: use student top-k ∪ teacher top-k for KL loss and loss_mask filtering
+            parser.add_argument(
+                "--opd-union-topk-kl",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable union topk KL mode. Replaces teacher-only topk KL loss with "
+                    "student top-k ∪ teacher top-k union set KL. Gradients flow through all "
+                    "union tokens (up to 2k). No renormalization; uses raw log probs."
+                ),
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable loss_mask filtering based on union topk KL values. "
+                    "Tokens with KL inside [low, high] are masked out to avoid "
+                    "low-KL tokens diluting gradients. Requires --opd-union-topk-kl."
+                ),
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter-mode",
+                type=str,
+                default="threshold",
+                choices=["threshold", "quantile"],
+                help="Filter mode: 'threshold' uses fixed values, 'quantile' uses batch-level percentiles.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter-threshold-low",
+                type=float,
+                default=None,
+                help="KL lower bound. Tokens with KL >= low and KL <= high are filtered out.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter-threshold-high",
+                type=float,
+                default=None,
+                help="KL upper bound. Tokens with KL >= low and KL <= high are filtered out.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter-quantile-low",
+                type=float,
+                default=None,
+                help="Lower quantile (e.g. 0.2) for dynamic threshold computation within batch.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-kl-filter-quantile-high",
+                type=float,
+                default=None,
+                help="Upper quantile (e.g. 0.8) for dynamic threshold computation within batch.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence",
+                action="store_true",
+                default=False,
+                help="Enable teacher next-token confidence reward for union topk KL.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-coef",
+                type=float,
+                default=0.1,
+                help="Coefficient for the confidence reward term.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-k",
+                type=int,
+                default=5,
+                help="Number of student top-K candidates for confidence (can differ from union k).",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-entropy-threshold",
+                type=float,
+                default=1.0,
+                help="Student entropy threshold; only high-entropy positions get confidence reward.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-model-name",
+                type=str,
+                default=None,
+                help="Model name for tree-attention confidence queries. If not set, uses --teacher-model-name.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-urls",
+                type=str,
+                nargs="+",
+                default=None,
+                help="URL(s) for tree-attention confidence queries. If multiple, one is randomly chosen per request. If not set, uses --rm-url.",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-normalize-std",
+                action="store_true",
+                default=False,
+                help="If set, normalize confidence by (x-mean)/std; otherwise just (x-mean).",
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-max-tree-tokens",
+                type=int,
+                default=0,
+                help=(
+                    "Max total tokens per tree-attention request for confidence queries. "
+                    "0 = unlimited. When exceeded, split into multiple requests "
+                    "sharing the same trunk (leverages SGLang prefix caching)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-alternate-steps",
+                type=int,
+                default=0,
+                help=(
+                    "Alternate between pure reverse-KL and pure confidence loss every N steps. "
+                    "0 = no alternation (use combined loss). "
+                    "When N>0: steps [0,N) use pure reverse-KL, steps [N,2N) use pure confidence, then cycle."
+                ),
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-via-advantage",
+                action="store_true",
+                default=False,
+                help=(
+                    "Route union-topk confidence signal through the advantage path instead of "
+                    "the direct union-topk KL loss. When enabled, confidence bonus is added to "
+                    "advantages (so gradients only flow through the sampled token at each position, "
+                    "matching standard OPD behavior), and confidence is disabled in compute_union_topk_kl."
+                ),
+            )
+            parser.add_argument(
+                "--opd-union-topk-confidence-via-advantage-coef",
+                type=float,
+                default=0.1,
+                help=(
+                    "Coefficient for the confidence bonus when applied via the advantage path "
+                    "(--opd-union-topk-confidence-via-advantage). "
+                    "Modifies advantages as: A_t' = A_t + coef * confidence_t."
+                ),
+            )
+            parser.add_argument(
+                "--opd-dualsample-truncate-by-teacher-logit-y",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable truncation of the KL penalty based on teacher's logit for sampled token y. "
+                    "Truncates per-sample KL at the first position where the teacher becomes uncertain."
+                ),
+            )
+            parser.add_argument(
+                "--opd-dualsample-truncate-window-size",
+                type=int,
+                default=32,
+                help="Lookahead window size for teacher_logit_y truncation. Default is 32.",
+            )
+            parser.add_argument(
+                "--opd-dualsample-truncate-threshold",
+                type=float,
+                default=None,
+                help=(
+                    "Fixed threshold for teacher_logit_y truncation (lookahead mode). "
+                    "Truncates at the first position where mean(t_logit_y[pos:pos+window]) < threshold. "
+                    "If None, uses lookback rolling-mean mode instead."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-prefix-mask-len",
+                type=int,
+                default=None,
+                help=(
+                    "Mask reverse-KL for the first N tokens of each response during OPD training. "
+                    "Only tokens at position >= N (0-indexed) contribute to the KL penalty. "
+                    "Example: --opd-kl-prefix-mask-len 9000 skips the first 9k response tokens."
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-decay",
+                type=float,
+                default=1.0,
+                help=(
+                    "Per-position exponential decay factor for the reverse-KL penalty. "
+                    "At position t (0-indexed), the KL contribution is multiplied by decay^t. "
+                    "decay=1.0 (default) means no decay. "
+                    "decay=0.999 down-weights later tokens, focusing the KL signal on the beginning of the response. "
+                    "Example: --opd-kl-decay 0.999"
+                ),
+            )
+            parser.add_argument(
+                "--opd-kl-future-gamma",
+                type=float,
+                default=1.0,
+                help=(
+                    "Future-weighted KL: replace per-token KL at position t with a gamma-discounted "
+                    "weighted average of KL from position t to end of sequence. "
+                    "kl_future[t] = sum_{s=t}^{T} gamma^(s-t)*kl[s] / sum_{s=t}^{T} gamma^(s-t). "
+                    "gamma=1.0 (default) disables this feature (no change to per-token KL). "
+                    "gamma<1.0 weights near-future tokens more heavily than distant ones. "
+                    "Example: --opd-kl-future-gamma 0.99"
+                ),
+            )
+            # RC-OPD arguments
+            parser.add_argument(
+                "--opd-use-rc",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable Rank-Consistency OPD (RC-OPD). "
+                    "Classifies each response token as consistent or inconsistent based on whether "
+                    "the ordering of (student token x, teacher token y) is the same in both distributions, "
+                    "then applies per-class configurable loss. "
+                    "Requires --opd-type=sglang and teacher top-k logprobs (--opd-teacher-topk-size)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-rc-consistent-loss",
+                type=str,
+                choices=["opd_kl", "mse", "none"],
+                default="none",
+                help=(
+                    "Loss type for tokens where student and teacher agree on the ranking of x vs y. "
+                    "'opd_kl': reverse KL contribution = log_ps(x) - log_pt(x). "
+                    "'mse': (ps(x)-pt(x))^2 + (ps(y)-pt(y))^2. "
+                    "'none': no loss for this class. Default is 'none'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-rc-inconsistent-loss",
+                type=str,
+                choices=["opd_kl", "mse", "none"],
+                default="opd_kl",
+                help=(
+                    "Loss type for tokens where student and teacher disagree on the ranking of x vs y. "
+                    "'opd_kl': reverse KL contribution = log_ps(x) - log_pt(x). "
+                    "'mse': (ps(x)-pt(x))^2 + (ps(y)-pt(y))^2. "
+                    "'none': no loss for this class. Default is 'opd_kl'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-rc-consistent-coef",
+                type=float,
+                default=1.0,
+                help="Loss coefficient for consistent tokens in RC-OPD. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-rc-inconsistent-coef",
+                type=float,
+                default=1.0,
+                help="Loss coefficient for inconsistent tokens in RC-OPD. Default is 1.0.",
+            )
+            parser.add_argument(
+                "--opd-rc-sign-eps",
+                type=float,
+                default=1e-6,
+                help=(
+                    "Epsilon threshold for sign comparison in RC-OPD consistency check. "
+                    "Log-prob differences with absolute value <= eps are treated as zero (neutral), "
+                    "avoiding misclassification due to floating-point noise. Default is 1e-6."
+                ),
+            )
+            parser.add_argument(
+                "--opd-rc-mse-y-gamma",
+                type=float,
+                default=1.0,
+                help=(
+                    "Weight for the y-side term in RC-OPD MSE loss. "
+                    "MSE loss = (ps(x)-pt(x))^2 + gamma*(ps(y)-pt(y))^2. "
+                    "Set < 1.0 to down-weight the y term, 0.0 to disable it. Default is 1.0."
+                ),
+            )
+            parser.add_argument(
+                "--opd-confidence-reward-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for teacher confidence reward term added to advantages. "
+                    "Modifies advantages as: A_t' = A_t + coef * confidence_t. "
+                    "0.0 disables (default). "
+                    "The confidence signal type is set by --opd-confidence-type."
+                ),
+            )
+            parser.add_argument(
+                "--opd-confidence-type",
+                type=str,
+                default="logpt_x",
+                choices=[
+                    "logpt_x",
+                    "ppl",
+                    "near-ppl",
+                    "max_logp",
+                    "entropy",
+                    "action-entropy",
+                    "action-max_logp",
+                    "delta-entropy",
+                    "delta-max_logp",
+                    "future-ppl",
+                    "future-action-maxlogp",
+                ],
+                help=(
+                    "Type of teacher confidence signal used when --opd-confidence-reward-coef != 0. "
+                    "'logpt_x': per-token log p_teacher(x_t) — teacher's log-prob of the student's "
+                    "sampled token at each position (requires teacher_log_probs). "
+                    "'ppl': per-token prefix perplexity of teacher on the response; at position t "
+                    "computes -exp(-1/(t+1)*sum_{i<=t} log p_teacher(x_i)); lower prefix PPL = "
+                    "teacher more confident up to this point = higher reward "
+                    "(requires teacher_log_probs). "
+                    "'near-ppl': same as 'ppl' but only uses the previous 128 tokens (sliding window) "
+                    "instead of the full prefix (requires teacher_log_probs). "
+                    "'max_logp': log-prob of teacher's top-1 token at each position — measures how "
+                    "peaked the teacher distribution is (requires teacher_dist_topk_log_probs). "
+                    "'entropy': negative entropy of teacher's distribution — higher means more "
+                    "confident/concentrated teacher (requires teacher_dist_topk_log_probs). "
+                    "'action-entropy': -H(pi_T|x_{<t+1}), teacher entropy after seeing x_t — "
+                    "action reward version of 'entropy', shifted by one position "
+                    "(requires teacher_dist_topk_log_probs). "
+                    "'action-max_logp': max_logp[t+1], teacher top-1 confidence after seeing x_t — "
+                    "action reward version of 'max_logp', shifted by one position "
+                    "(requires teacher_dist_topk_log_probs). "
+                    "'delta-entropy': H(pi_T|x_{<t}) - H(pi_T|x_{<t},x_t), i.e. entropy reduction "
+                    "caused by x_t; positive when the student token pulls context toward the teacher's "
+                    "familiar distribution, sharpening its next-step prediction "
+                    "(requires teacher_dist_topk_log_probs). "
+                    "'delta-max_logp': max_logp[t+1] - max_logp[t], increase in teacher top-1 "
+                    "confidence caused by x_t; positive when x_t makes the teacher more peaked at "
+                    "the next position (requires teacher_dist_topk_log_probs). "
+                    "Default is 'logpt_x'."
+                ),
+            )
+            parser.add_argument(
+                "--opd-confidence-future-gamma",
+                type=float,
+                default=1.0,
+                help=(
+                    "Gamma for future-weighted confidence reward. "
+                    "conf_reward[t] = sum_{s=t+1}^{T} gamma^(s-t-1) * raw[s]. "
+                    "1.0 = no decay (sum all equally). 0.99 = effective window ~100 tokens. "
+                    "Used with 'future-ppl' and 'future-action-maxlogp' confidence types."
+                ),
+            )
+            parser.add_argument(
+                "--opd-confidence-ppl-window",
+                type=int,
+                default=None,
+                help=(
+                    "Window size N for 'future-ppl' confidence type. "
+                    "At position t, PPL is computed over tokens [t+1, t+N]. "
+                    "None = use all remaining tokens (limited only by gamma decay)."
+                ),
+            )
+            parser.add_argument(
+                "--opd-confidence-clip-min",
+                type=float,
+                default=None,
+                help=(
+                    "Minimum value to clip the teacher confidence signal to, after normalization. "
+                    "All confidence types have max=0; this controls the lower bound, e.g. "
+                    "--opd-confidence-clip-min -10.0 prevents extreme penalties at very uncertain positions. "
+                    "Default is None (no clipping)."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -974,6 +1697,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Directory to store wandb logs. Default is ./wandb in current directory.",
             )
             parser.add_argument("--wandb-key", type=str, default=None)
+            parser.add_argument("--wandb-no-resume", action="store_true", default=False)
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
@@ -1097,6 +1821,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--dump-student-topk-size",
+                type=int,
+                default=0,
+                help=(
+                    "If > 0, compute and save student top-k tokens and log probs during training forward pass "
+                    "into the debug train data dump (requires --save-debug-train-data or --dump-details). "
+                    "Uses vocab-parallel-aware top-k to handle tensor parallelism correctly. Default is 0 (disabled)."
+                ),
+            )
+            parser.add_argument(
                 "--dump-details",
                 type=str,
                 default=None,
@@ -1166,6 +1900,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="URL for the reward model service for --rm-type remote_rm, e.g. http://localhost:8000",
             )
             parser.add_argument(
+                "--rm-max-concurrent-requests",
+                type=int,
+                default=32,
+                help=(
+                    "Maximum number of concurrent requests to reward model service. "
+                    "Limits parallelism to prevent overwhelming external RM services. "
+                    "Applies to all async RMs including: remote_rm, custom RMs, OPD teacher models. "
+                    "Default: 32. Reduce to 8-16 for large teacher models or low-throughput services."
+                ),
+            )
+            parser.add_argument(
                 "--custom-rm-path",
                 type=str,
                 default=None,
@@ -1176,12 +1921,80 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--eval-rm-type",
+                type=str,
+                default=None,
+                help=(
+                    "Type of the reward model used during evaluation. "
+                    "If not set, will use --rm-type for both training and evaluation. "
+                    "This is useful when training uses custom RM that returns dict (e.g., OPD with teacher logprobs) "
+                    "but evaluation needs scalar rewards."
+                ),
+            )
+            parser.add_argument(
+                "--eval-custom-rm-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the custom reward model function for evaluation. "
+                    "If not set, will use --custom-rm-path for both training and evaluation. "
+                    "The function should have the signature `def custom_rm(args, sample) -> float`."
+                ),
+            )
+            parser.add_argument(
                 "--custom-reward-post-process-path",
                 type=str,
                 default=None,
                 help=(
                     "Path to the custom function that will post process reward, by default it will be the normalization for grpo. "
                 ),
+            )
+            parser.add_argument(
+                "--teacher-model-name",
+                type=str,
+                default=None,
+                help=(
+                    "Optional model name to pass to teacher model server (for multi-model SGLang server). "
+                    "Used with --opd-type sglang to select specific teacher model in reward_func."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-temperature",
+                type=float,
+                default=None,
+                help=(
+                    "Sampling temperature used when querying the teacher model for log-probs. "
+                    "If not set, falls back to --rollout-temperature. "
+                    "Overridden by --teacher-temperature-anneal-* when annealing is configured. "
+                    "Example: --teacher-temperature 0.7"
+                ),
+            )
+            parser.add_argument(
+                "--teacher-temperature-anneal-start-step",
+                type=int,
+                default=None,
+                help="Rollout step at which teacher temperature annealing begins.",
+            )
+            parser.add_argument(
+                "--teacher-temperature-anneal-end-step",
+                type=int,
+                default=None,
+                help=(
+                    "Rollout step at which teacher temperature annealing ends. "
+                    "After this step the temperature is fixed at --teacher-temperature-anneal-end-value."
+                ),
+            )
+            parser.add_argument(
+                "--teacher-temperature-anneal-start-value",
+                type=float,
+                default=None,
+                help="Teacher temperature at the start of the annealing window.",
+            )
+            parser.add_argument(
+                "--teacher-temperature-anneal-end-value",
+                type=float,
+                default=None,
+                help="Teacher temperature at the end of the annealing window (and fixed thereafter).",
             )
             parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
@@ -1368,6 +2181,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
         parser = add_algo_arguments(parser)
+        parser = add_on_policy_distillation_arguments(parser)
         parser = add_wandb_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_router_arguments(parser)
@@ -1408,7 +2222,7 @@ def parse_args(add_custom_arguments=None):
         from slime.backends.megatron_utils.arguments import validate_args as megatron_validate_args
 
         args = megatron_parse_args(extra_args_provider=add_slime_arguments)
-        if args.hf_checkpoint:
+        if args.hf_checkpoint and not args.debug_rollout_only:
             hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
             hf_validate_args(args, hf_config)
 
@@ -1517,6 +2331,94 @@ def slime_validate_args(args):
                 "please make sure it is a valid megatron checkpoint directory."
             )
 
+    # Validate on-policy distillation (OPD) arguments
+    if args.use_opd:
+        if args.opd_type is None:
+            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+
+        if args.opd_type == "megatron":
+            if args.opd_teacher_load is None:
+                raise ValueError(
+                    "--opd-teacher-load is required when --opd-type=megatron. "
+                    "Please provide the path to the teacher model checkpoint."
+                )
+            if not os.path.exists(args.opd_teacher_load):
+                raise FileNotFoundError(
+                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
+                )
+            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
+                logger.info(
+                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
+                    "please make sure it is a valid megatron checkpoint directory."
+                )
+
+        elif args.opd_type == "sglang":
+            if args.opd_teacher_load is not None:
+                raise ValueError(
+                    "--opd-teacher-load should not be set when --opd-type=sglang. "
+                    "In sglang mode, teacher log-probs are obtained from external server during rollout."
+                )
+
+        # Validate G-OPD specific arguments
+        if args.opd_lambda < 0:
+            raise ValueError(f"--opd-lambda must be >= 0, got {args.opd_lambda}")
+
+        if args.opd_lambda != 1.0:
+            if not args.opd_use_reward_correction:
+                if args.kl_coef == 0:
+                    raise ValueError(
+                        f"G-OPD with --opd-lambda={args.opd_lambda} requires student's reference model. "
+                        "Either set --kl-coef > 0 or use --opd-use-reward-correction with --teacher-base-model-name."
+                    )
+            else:
+                if args.teacher_base_model_name is None:
+                    raise ValueError("--opd-use-reward-correction enabled but --teacher-base-model-name not specified")
+
+        if args.opd_use_orm and not args.rm_type and not args.custom_rm_path:
+            raise ValueError(
+                "--opd-use-orm enabled but no ORM configured. "
+                "Set --rm-type (e.g., deepscaler/math/f1) or --custom-rm-path"
+            )
+
+        if args.opd_use_reward_correction and args.opd_lambda == 1.0:
+            logger.warning(
+                "[G-OPD] --opd-use-reward-correction has no effect when --opd-lambda=1.0. "
+                "Set --opd-lambda > 1 (e.g., 1.25) for ExOPD with reward correction."
+            )
+
+        # Set default values for sign-dependent KL coefficients
+        if args.opd_kl_coef_positive is None:
+            args.opd_kl_coef_positive = args.opd_kl_coef
+        if args.opd_kl_coef_negative is None:
+            args.opd_kl_coef_negative = args.opd_kl_coef
+        if args.opd_kl_coef_zero is None:
+            args.opd_kl_coef_zero = args.opd_kl_coef
+
+        # Log asymmetric configuration
+        use_sign_penalty = getattr(args, "opd_use_sign_penalty", False)
+        if args.opd_kl_coef_positive != args.opd_kl_coef_negative:
+            if use_sign_penalty:
+                logger.info(
+                    f"[OPD] Using sign-dependent FIXED penalties: "
+                    f"positive={args.opd_kl_coef_positive}, "
+                    f"negative={args.opd_kl_coef_negative}, "
+                    f"zero={args.opd_kl_coef_zero}"
+                )
+            else:
+                logger.info(
+                    f"[OPD] Using sign-dependent COEFFICIENTS: "
+                    f"positive={args.opd_kl_coef_positive}, "
+                    f"negative={args.opd_kl_coef_negative}, "
+                    f"zero={args.opd_kl_coef_zero}"
+                )
+        elif use_sign_penalty:
+            logger.info(f"[OPD] Using sign-dependent fixed penalty mode with uniform value: {args.opd_kl_coef}")
+
+    else:
+        # If OPD is not enabled, opd_teacher_load should not be set
+        if args.opd_teacher_load is not None:
+            raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+
     # TODO: During loading, we need to set the start_rollout_id here.
     if args.megatron_to_hf_mode == "bridge":
         if args.load is None:
@@ -1535,6 +2437,14 @@ def slime_validate_args(args):
             if args.ref_ckpt_step is not None:
                 args.ckpt_step = args.ref_ckpt_step
             args.start_rollout_id = 0
+
+    # Load wandb run ID for resume if checkpoint exists
+    if args.use_wandb and args.load and os.path.exists(args.load) and (not args.wandb_no_resume):
+        wandb_id_file = os.path.join(args.load, "wandb_run_id.txt")
+        if os.path.exists(wandb_id_file) and args.wandb_run_id is None:
+            with open(wandb_id_file, "r") as f:
+                args.wandb_run_id = f.read().strip()
+                logger.info(f"Resuming wandb run: {args.wandb_run_id} from checkpoint")
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
@@ -1653,6 +2563,15 @@ def slime_validate_args(args):
         args.grpo_std_normalization = False
         logger.info("n_samples_per_prompt is set to 1, grpo_std_normalization will be set to False.")
 
+    # Validate GRPO sample filter
+    if args.grpo_sample_filter != "both":
+        if args.advantage_estimator not in ["grpo", "gspo"]:
+            logger.warning(
+                f"--grpo-sample-filter is set to '{args.grpo_sample_filter}' "
+                f"but advantage_estimator is '{args.advantage_estimator}'. "
+                f"Sample filtering is primarily designed for GRPO/GSPO."
+            )
+
     if args.over_sampling_batch_size is None:
         args.over_sampling_batch_size = args.rollout_batch_size
 
@@ -1714,6 +2633,9 @@ def slime_validate_args(args):
         assert (
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
+
+    if args.only_train_params_name_list and args.freeze_params_name_list:
+        raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
 
 
 def hf_validate_args(args, hf_config):

@@ -20,6 +20,12 @@ def add_sglang_router_arguments(parser):
         help="Port of the SGLang router",
     )
     parser.add_argument(
+        "--sglang-router-policy",
+        type=str,
+        default=None,
+        help="Routing policy for the SGLang router (e.g., 'consistent_hashing', 'round_robin')",
+    )
+    parser.add_argument(
         "--sglang-router-request-timeout-secs",
         type=int,
         default=14400,
@@ -33,7 +39,7 @@ def add_sglang_arguments(parser):
     Add arguments to the parser for the SGLang server.
     """
     parser = add_sglang_router_arguments(parser)
-    parser.set_defaults(router_balance_abs_threshold=10, router_balance_rel_threshold=1.2)
+    parser.set_defaults(router_balance_abs_threshold=1, router_balance_rel_threshold=1.02)
     parser.add_argument("--sglang-server-concurrency", type=int, default=512)
 
     old_add_argument = parser.add_argument

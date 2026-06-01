@@ -136,6 +136,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
 
+    # Enable topk logprobs for OPD topk mode
+    if getattr(args, "opd_use_topk", False):
+        payload["top_logprobs_num"] = getattr(args, "opd_topk_size", 10)
+    # Union topk confidence uses opd_teacher_topk_size for entropy estimation
+    if getattr(args, "opd_union_topk_confidence", False):
+        conf_topk = getattr(args, "opd_teacher_topk_size", 50)
+        payload["top_logprobs_num"] = max(payload.get("top_logprobs_num", 0), conf_topk)
+
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
@@ -163,6 +171,50 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
             new_response_tokens, new_response_log_probs = [], []
+
+        # Extract topk information if available (for OPD topk mode)
+        if "output_top_logprobs" in output["meta_info"]:
+            # SGLang returns: [[[logprob, token_id, null], ...], ...]
+            # Format: list of positions, each containing list of [logprob, token_id, null] entries
+            top_logprobs_list = output["meta_info"]["output_top_logprobs"]
+            new_topk_tokens = []
+            new_topk_log_probs = []
+
+            # Track replacement count for monitoring
+            topk_replacement_count = 0
+
+            for pos_idx, top_logprobs_entries in enumerate(top_logprobs_list):
+                # Parse SGLang list format: [[logprob, token_id, null], ...]
+                # Already sorted by logprob descending from SGLang
+                tokens = [int(entry[1]) for entry in top_logprobs_entries]  # entry[1] is token_id
+                log_probs = [entry[0] for entry in top_logprobs_entries]     # entry[0] is logprob
+
+                # Ensure sampled token is in topk (replace topk[-1] if not)
+                if pos_idx < len(new_response_tokens):  # Ensure index is valid
+                    sampled_token = new_response_tokens[pos_idx]
+                    sampled_logprob = new_response_log_probs[pos_idx]
+
+                    if sampled_token not in tokens:
+                        # Sampled token not in topk, replace the last one (lowest probability)
+                        tokens[-1] = sampled_token
+                        log_probs[-1] = sampled_logprob
+                        topk_replacement_count += 1
+
+                new_topk_tokens.append(tokens)
+                new_topk_log_probs.append(log_probs)
+
+            # Store replacement statistics
+            if topk_replacement_count > 0:
+                if not hasattr(sample, 'topk_replacement_count'):
+                    sample.topk_replacement_count = 0
+                sample.topk_replacement_count += topk_replacement_count
+
+            if sample.rollout_topk_tokens is None:
+                sample.rollout_topk_tokens = []
+            if sample.rollout_topk_log_probs is None:
+                sample.rollout_topk_log_probs = []
+            sample.rollout_topk_tokens += new_topk_tokens
+            sample.rollout_topk_log_probs += new_topk_log_probs
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -244,7 +296,7 @@ async def generate_and_rm(
 
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
+        rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
         return samples
@@ -253,7 +305,7 @@ async def generate_and_rm(
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            sample.reward = await async_rm(args, sample, evaluation=evaluation)
 
     return sample
 
@@ -280,7 +332,7 @@ async def generate_and_rm_group(
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
-        rewards = await batched_async_rm(args, group)
+        rewards = await batched_async_rm(args, group, evaluation=evaluation)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
@@ -344,6 +396,9 @@ async def generate_rollout_async(
     """
     assert args.rollout_global_dataset
 
+    # Make current rollout_id accessible to reward_func and other callees via args
+    args.current_rollout_id = rollout_id
+
     state = GenerateState(args)
 
     # instantiate data filters
@@ -359,7 +414,7 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout generation[{rollout_id}]")
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
@@ -373,8 +428,15 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
+                # Format reward for logging (avoid printing large dicts in OPD scenario)
+                reward_str = (
+                    f"dict with keys: {list(sample.reward.keys())}"
+                    if isinstance(sample.reward, dict)
+                    else str(sample.reward)
+                )
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, "
+                    f"label: {str(sample.label)[:100]}, reward: {reward_str}",
                 )
                 do_print = False
 
@@ -394,8 +456,13 @@ async def generate_rollout_async(
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+    # Format reward for logging (avoid printing large dicts in OPD scenario)
+    reward_str = (
+        f"dict with keys: {list(sample.reward.keys())}" if isinstance(sample.reward, dict) else str(sample.reward)
+    )
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, "
+        f"label: {str(sample.label)[:100]}, reward: {reward_str}",
     )
 
     # there are still some unfinished requests, abort them
@@ -514,10 +581,16 @@ async def eval_rollout_single_dataset(
     for coro in asyncio.as_completed(tasks):
         sample = await coro
         if do_print:
+            # Format reward for logging (avoid printing large dicts in OPD scenario)
+            reward_str = (
+                f"dict with keys: {list(sample.reward.keys())}"
+                if isinstance(sample.reward, dict)
+                else str(sample.reward)
+            )
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"reward={reward_str}"
             )
             do_print = False
         if isinstance(sample, list):

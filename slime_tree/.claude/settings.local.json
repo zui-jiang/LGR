@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "WebFetch(domain:bytedance.github.io)",
+      "Bash(grep:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(chmod:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(pre-commit run:*)"
+    ]
+  }
+}

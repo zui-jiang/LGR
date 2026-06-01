@@ -5,9 +5,13 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
-from slime.utils.memory_utils import print_memory
+from slime.utils.memory_utils import available_memory, clear_memory, print_memory
 
 logger = logging.getLogger(__name__)
+
+# Flag to enable/disable enhanced NCCL cleanup
+# Set via environment variable: ENABLE_NCCL_CLEANUP=1
+_ENABLE_ENHANCED_CLEANUP = os.environ.get("ENABLE_NCCL_CLEANUP", "0") == "1"
 
 old_new_group_dict = {}
 
@@ -130,8 +134,21 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
 
     @staticmethod
     def destroy_process_groups():
+        """Destroy all reloadable process groups with optional enhanced cleanup."""
         pid = os.getpid()
-        for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
+        reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
+
+        # Enhanced cleanup: synchronize before destroy
+        if _ENABLE_ENHANCED_CLEANUP and dist.is_initialized():
+            try:
+                from slime.utils.nccl_cleanup_helper import synchronize_before_destroy
+                logger.info(f"[Rank {dist.get_rank()}] Synchronizing before destroying {len(reloadable_groups)} process groups")
+                synchronize_before_destroy(use_gloo=True)
+            except Exception as e:
+                logger.warning(f"[Rank {dist.get_rank()}] Enhanced cleanup synchronization failed: {e}")
+
+        # Destroy each process group
+        for reloadable_group in reloadable_groups:
             if reloadable_group.group is None:
                 continue
             try:
@@ -145,17 +162,76 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
             del reloadable_group.group
             reloadable_group.group = None
 
+        # Enhanced cleanup: force cleanup of NCCL state
+        if _ENABLE_ENHANCED_CLEANUP:
+            try:
+                from slime.utils.nccl_cleanup_helper import force_cleanup_nccl_state
+                cleanup_delay = float(os.environ.get("NCCL_CLEANUP_DELAY", "2.0"))
+                logger.info(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Force cleaning NCCL state with {cleanup_delay}s delay")
+                force_cleanup_nccl_state(delay_seconds=cleanup_delay)
+            except Exception as e:
+                logger.warning(f"Enhanced NCCL cleanup failed: {e}")
+
     @staticmethod
     def reload_process_groups():
+        """Reload all reloadable process groups with optional retry mechanism."""
+        import time
+
         pid = os.getpid()
         reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
         logger.info(f"Reloading {len(reloadable_groups)} process groups in pid {pid}")
         old_new_group = old_new_group_dict.get(pid)
-        for reloadable_group in reloadable_groups:
+
+        # Determine retry settings
+        if _ENABLE_ENHANCED_CLEANUP:
+            max_retries = int(os.environ.get("NCCL_RELOAD_RETRIES", "3"))
+            retry_delay = float(os.environ.get("NCCL_RELOAD_RETRY_DELAY", "5.0"))
+        else:
+            max_retries = 1
+            retry_delay = 0.0
+
+        # Reload each group with retry logic
+        for idx, reloadable_group in enumerate(reloadable_groups):
             if reloadable_group.group is not None:
                 continue
-            group = old_new_group(ranks=reloadable_group.group_info["ranks"], backend="nccl")
-            reloadable_group.group = group
+
+            for attempt in range(max_retries):
+                try:
+                    group = old_new_group(ranks=reloadable_group.group_info["ranks"], backend="nccl")
+                    reloadable_group.group = group
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"[Rank {rank}] Failed to reload process group {idx}/{len(reloadable_groups)} "
+                            f"(attempt {attempt + 1}/{max_retries}): {e}. Retrying in {retry_delay}s..."
+                        )
+                        time.sleep(retry_delay)
+
+                        # Force cleanup before retry
+                        if _ENABLE_ENHANCED_CLEANUP:
+                            try:
+                                from slime.utils.nccl_cleanup_helper import force_cleanup_nccl_state
+                                force_cleanup_nccl_state(delay_seconds=1.0)
+                            except Exception:
+                                pass
+                    else:
+                        logger.error(
+                            f"[Rank {rank}] Failed to reload process group {idx}/{len(reloadable_groups)} "
+                            f"after {max_retries} attempts: {e}"
+                        )
+                        raise
+
+        # Enhanced cleanup: synchronize after reload to verify all ranks succeeded
+        if _ENABLE_ENHANCED_CLEANUP and dist.is_initialized():
+            try:
+                from slime.utils.nccl_cleanup_helper import synchronize_after_reload
+                logger.info(f"[Rank {dist.get_rank()}] Synchronizing after reloading {len(reloadable_groups)} process groups")
+                synchronize_after_reload(use_gloo=True, retry_on_failure=True)
+            except Exception as e:
+                logger.warning(f"[Rank {dist.get_rank()}] Enhanced cleanup post-reload sync failed: {e}")
 
     def rank(self) -> int:
         return self.group.rank()
@@ -275,6 +351,9 @@ def reload_process_groups():
 @contextmanager
 def _wrap_low_level_call():
     try:
+        mem_info = available_memory()
+        if mem_info["free_GB"] < 5:
+            clear_memory()
         yield
     except Exception as e:
         mem_info = print_memory("after torch distributed error")

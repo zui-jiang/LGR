@@ -31,7 +31,7 @@ from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
-from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
+from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_student_topk_post, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -49,10 +49,11 @@ class MegatronTrainRayActor(TrainRayActor):
         args: Namespace,
         role: str,
         with_ref: bool = False,
+        with_opd_teacher: bool = False,
     ) -> int | None:
         monkey_patch_torch_dist()
 
-        super().init(args, role, with_ref)
+        super().init(args, role, with_ref, with_opd_teacher)
 
         init(args)
 
@@ -62,8 +63,8 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof = TrainProfiler(args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
-        for i in range(dist.get_world_size()):
-            if i == dist.get_rank():
+        for i in range(args.num_gpus_per_node):
+            if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
@@ -113,6 +114,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
 
+        # Load teacher model for Megatron-based on-policy distillation
+        if with_opd_teacher:
+            self.load_other_checkpoint("teacher", args.opd_teacher_load)
+
         if self.args.keep_old_actor:
             # Load old_actor checkpoint
             self.load_other_checkpoint("old_actor", args.load)
@@ -134,6 +139,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # empty cache after initialization
         clear_memory()
+
+        # Save wandb run ID immediately to enable resume even if training crashes early
+        if is_megatron_main_rank():
+            self._save_wandb_run_id()
 
         if self.args.offload_train:
             # recover to actor in the end.
@@ -218,12 +227,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 continue
             rollout_data[key] = [
                 torch.tensor(
-                    slice_log_prob_with_cp(
-                        log_prob,
-                        total_length,
-                        response_length,
-                        self.args.qkv_format,
-                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                    (
+                        slice_log_prob_with_cp(
+                            log_prob,
+                            total_length,
+                            response_length,
+                            self.args.qkv_format,
+                            rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                        )
                     ),
                     device=torch.cuda.current_device(),
                     dtype=torch.float32,
@@ -237,6 +248,90 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
             ]
+
+        # Process teacher_sampled_tokens for RC-OPD: CP-slice and move to GPU (same logic as log_probs)
+        if "teacher_sampled_tokens" in rollout_data:
+            rollout_data["teacher_sampled_tokens"] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(
+                        tokens,
+                        total_length,
+                        response_length,
+                        self.args.qkv_format,
+                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                    ),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.long,
+                )
+                for i, (tokens, total_length, response_length) in enumerate(
+                    zip(
+                        rollout_data["teacher_sampled_tokens"],
+                        rollout_data["total_lengths"],
+                        rollout_data["response_lengths"],
+                        strict=False,
+                    )
+                )
+            ]
+
+        # Process TopK OPD fields if present
+        for key in ["rollout_topk_log_probs", "teacher_topk_log_probs"]:
+            if key not in rollout_data:
+                continue
+            # TopK log probs: list of [seq_len, k] tensors
+            processed_topk = []
+            for i, (topk_log_probs, total_length, response_length) in enumerate(
+                zip(
+                    rollout_data[key],
+                    rollout_data["total_lengths"],
+                    rollout_data["response_lengths"],
+                    strict=False,
+                )
+            ):
+                if topk_log_probs is None:
+                    processed_topk.append(None)
+                    continue
+
+                # Convert to tensor if not already
+                if not isinstance(topk_log_probs, torch.Tensor):
+                    topk_tensor = torch.tensor(topk_log_probs, dtype=torch.float32)
+                else:
+                    topk_tensor = topk_log_probs
+
+                # Slice for response length only (same as single log_probs)
+                # topk_tensor shape: [seq_len, k]
+                topk_tensor = topk_tensor[-response_length:]
+
+                # Move to GPU
+                topk_tensor = topk_tensor.to(device=torch.cuda.current_device())
+                processed_topk.append(topk_tensor)
+
+            rollout_data[key] = processed_topk
+
+        # Also process topk tokens (for debugging/validation)
+        if "rollout_topk_tokens" in rollout_data:
+            processed_topk_tokens = []
+            for i, (topk_tokens, response_length) in enumerate(
+                zip(
+                    rollout_data["rollout_topk_tokens"],
+                    rollout_data["response_lengths"],
+                    strict=False,
+                )
+            ):
+                if topk_tokens is None:
+                    processed_topk_tokens.append(None)
+                    continue
+
+                if not isinstance(topk_tokens, torch.Tensor):
+                    topk_tokens_tensor = torch.tensor(topk_tokens, dtype=torch.long)
+                else:
+                    topk_tokens_tensor = topk_tokens
+
+                topk_tokens_tensor = topk_tokens_tensor[-response_length:]
+                topk_tokens_tensor = topk_tokens_tensor.to(device=torch.cuda.current_device())
+                processed_topk_tokens.append(topk_tokens_tensor)
+
+            rollout_data["rollout_topk_tokens"] = processed_topk_tokens
+
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
@@ -335,6 +430,7 @@ class MegatronTrainRayActor(TrainRayActor):
     ) -> dict[str, list[torch.Tensor]]:
 
         with timer(f"{store_prefix}log_probs"):
+            with_topk = store_prefix == "" and getattr(self.args, "dump_student_topk_size", 0) > 0
             return forward_only(
                 get_log_probs_and_entropy,
                 self.args,
@@ -342,6 +438,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_iterator,
                 num_microbatches,
                 store_prefix=store_prefix,
+                with_topk=with_topk,
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
@@ -374,6 +471,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if rollout_id >= self.args.num_critic_only_steps:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
 
+        self.args.reopold_current_rollout_id = rollout_id
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
@@ -406,6 +504,20 @@ class MegatronTrainRayActor(TrainRayActor):
                             store_prefix="ref_",
                         )
                     )
+
+                # Forward teacher model to get teacher_log_probs for Megatron-based OPD
+                if "teacher" in self.weights_backuper.backup_tags:
+                    if self.args.use_routing_replay:
+                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    self._switch_model("teacher")
+                    rollout_data.update(
+                        self.compute_log_prob(
+                            data_iterator,
+                            num_microbatches,
+                            store_prefix="teacher_",
+                        )
+                    )
+
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     if self.args.use_routing_replay:
@@ -434,16 +546,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
+                self.args.reopold_current_rollout_id = rollout_id
                 compute_advantages_and_returns(self.args, rollout_data)
 
             if self.rollout_data_postprocess is not None:
-                self.rollout_data_postprocess(self.args)
+                self.rollout_data_postprocess(self.args, rollout_data)
 
-            log_rollout_data(rollout_id, self.args, rollout_data)
+            log_rollout_data(
+                rollout_id,
+                self.args,
+                rollout_data,
+            )
 
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            # (student topk post is computed via a separate forward_only after optimizer.step())
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -453,6 +571,23 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                 )
+            # Compute post-training student topk (weights already updated by optimizer.step()).
+            if getattr(self.args, "dump_student_topk_size", 0) > 0:
+                for iterator in data_iterator:
+                    iterator.reset()
+                rollout_data.update(
+                    forward_only(
+                        get_student_topk_post,
+                        self.args,
+                        self.model,
+                        data_iterator,
+                        num_microbatches,
+                    )
+                )
+
+            # Harvest student topk into rollout_data so save_debug_train_data can persist them.
+            # With dynamic batching, microbatches are processed in seqlen-balanced order (≠ original
+            # sample order), so we must reorder back using micro_batch_indices — same as forward_only.
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -476,6 +611,27 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights_backuper.backup("ref")
 
         log_perf_data(rollout_id, self.args)
+
+    def _save_wandb_run_id(self) -> None:
+        """Save wandb run ID immediately after training initialization.
+
+        This ensures the run ID persists even if training crashes before
+        the first checkpoint save.
+        """
+        if not self.args.use_wandb or not self.args.wandb_run_id:
+            return
+
+        if torch.distributed.get_rank() != 0:
+            return
+
+        # Ensure checkpoint directory exists
+        os.makedirs(self.args.save, exist_ok=True)
+
+        wandb_id_file = os.path.join(self.args.save, "wandb_run_id.txt")
+        with open(wandb_id_file, "w") as f:
+            f.write(self.args.wandb_run_id)
+
+        logger.info(f"Saved wandb run ID early: {self.args.wandb_run_id} -> {wandb_id_file}")
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
@@ -501,7 +657,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
             save_hf_model(self.args, rollout_id, self.model)
 
+        # CRITICAL FIX: Synchronize before destroy to ensure all ranks complete save
+        # This prevents NCCL state pollution when destroy_process_groups() is called
         if self.args.offload_train:
+            # Add explicit barrier before destroy to ensure all save operations complete
+            import os
+            if os.environ.get("ENABLE_NCCL_CLEANUP", "0") == "1":
+                try:
+                    logger.info(f"[Rank {dist.get_rank()}] Synchronizing after save, before destroy (rollout {rollout_id})")
+                    # Use gloo barrier for safety
+                    dist.barrier(group=get_gloo_group())
+                    # Also sync CUDA to ensure all GPU operations complete
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                except Exception as e:
+                    logger.warning(f"[Rank {dist.get_rank()}] Pre-destroy sync failed: {e}")
+
             destroy_process_groups()
 
     @timer
@@ -561,9 +732,13 @@ class MegatronTrainRayActor(TrainRayActor):
         self.args.no_load_rng = True
         self.args.finetune = True
 
+        old_ckpt_step = None
         if model_tag == "ref" and self.args.ref_ckpt_step is not None:
             old_ckpt_step = self.args.ckpt_step
             self.args.ckpt_step = self.args.ref_ckpt_step
+        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
+            old_ckpt_step = self.args.ckpt_step
+            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
 
         _, _ = load_checkpoint(
             self.model,
@@ -574,7 +749,7 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
 
-        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+        if old_ckpt_step is not None:
             self.args.ckpt_step = old_ckpt_step
 
         self.weights_backuper.backup(model_tag)

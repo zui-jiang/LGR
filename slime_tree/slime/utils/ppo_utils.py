@@ -158,6 +158,136 @@ def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group:
     return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
 
 
+def vocab_parallel_gather_log_softmax(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Compute log softmax and gather values at given token ids, supporting tensor parallelism.
+
+    When tensor parallelism is used, logits are sharded across ranks along the vocab dimension.
+    This function correctly computes the global log softmax and gathers the log probs for the
+    requested token ids, with full gradient support for backpropagation through student logits.
+
+    Args:
+        logits: Local (possibly sharded) logits with shape [seq_len, local_vocab_size].
+                Must be float32.
+        token_ids: Global token ids to gather, shape [seq_len, k]. Values are global vocab indices.
+        process_group: Tensor parallel process group. If None, logits are treated as full vocab.
+
+    Returns:
+        log_probs: Gathered log probs at token_ids positions, shape [seq_len, k].
+                   Has gradient w.r.t. logits.
+    """
+    seq_len, k = token_ids.shape
+    device = logits.device
+
+    # Step 1: Compute log-sum-exp over full vocab (the log normalizer).
+    # With TP: each rank computes local max, then all-reduce max, then local sum-exp, then all-reduce sum.
+    logits_max = logits.max(dim=-1, keepdim=True).values  # [seq_len, 1]
+    if process_group is not None:
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    shifted = logits - logits_max  # [seq_len, local_vocab]
+    exp_shifted = shifted.exp()
+    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)  # [seq_len, 1]
+    if process_group is not None:
+        dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=process_group)
+    log_normalizer = logits_max + sum_exp.log()  # [seq_len, 1]
+
+    # Step 2: For each requested token_id, gather the logit from the correct rank's shard.
+    # Determine vocab offset for this rank.
+    if process_group is not None:
+        local_vocab_size = logits.shape[-1]
+        tp_rank = dist.get_rank(group=process_group)
+        vocab_start = tp_rank * local_vocab_size
+        vocab_end = vocab_start + local_vocab_size
+    else:
+        local_vocab_size = logits.shape[-1]
+        vocab_start = 0
+        vocab_end = local_vocab_size
+
+    # Build a mask: which positions in token_ids belong to this rank's shard
+    # token_ids: [seq_len, k], values are global token ids
+    in_shard = (token_ids >= vocab_start) & (token_ids < vocab_end)  # [seq_len, k]
+
+    # Clamp to valid local indices for safe gather (out-of-shard entries will be zeroed)
+    local_ids = (token_ids - vocab_start).clamp(min=0, max=local_vocab_size - 1)  # [seq_len, k]
+
+    # Gather local logits at local_ids: logits [seq_len, local_vocab] -> [seq_len, k]
+    gathered_logits = logits.gather(dim=-1, index=local_ids)  # [seq_len, k]
+    # Zero out entries not belonging to this rank
+    gathered_logits = gathered_logits * in_shard.to(gathered_logits.dtype)
+
+    # All-reduce to sum contributions across TP ranks (each rank contributes only its shard entries)
+    if process_group is not None:
+        dist.all_reduce(gathered_logits, op=dist.ReduceOp.SUM, group=process_group)
+
+    # Step 3: log softmax = gathered_logit - log_normalizer
+    log_probs = gathered_logits - log_normalizer  # [seq_len, k]
+
+    return log_probs
+
+
+def vocab_parallel_topk(
+    logits: torch.Tensor,
+    k: int,
+    process_group: dist.ProcessGroup | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute global top-k over vocab-parallel sharded logits.
+
+    Each rank holds a shard of the full vocabulary. This function computes the global
+    top-k tokens and their log-softmax values across all TP ranks.
+
+    Args:
+        logits: Local sharded logits, shape [seq_len, local_vocab_size].
+        k: Number of top tokens to retrieve.
+        process_group: Tensor parallel process group. If None, treats logits as full vocab.
+
+    Returns:
+        topk_log_probs: Log softmax values of top-k tokens, shape [seq_len, k].
+        topk_token_ids: Global token ids of top-k tokens, shape [seq_len, k].
+    """
+    seq_len = logits.shape[0]
+    device = logits.device
+
+    if process_group is not None:
+        local_vocab_size = logits.shape[-1]
+        tp_rank = dist.get_rank(group=process_group)
+        tp_size = dist.get_world_size(group=process_group)
+        vocab_start = tp_rank * local_vocab_size
+    else:
+        tp_size = 1
+        vocab_start = 0
+
+    # Step 1: local top-k per rank (logits, local indices)
+    local_topk_vals, local_topk_local_ids = logits.topk(min(k, logits.shape[-1]), dim=-1)  # [seq_len, k]
+    # Convert to global token ids
+    local_topk_global_ids = local_topk_local_ids + vocab_start  # [seq_len, k]
+
+    if process_group is not None:
+        # Step 2: all-gather local top-k candidates across TP ranks
+        # Each rank contributes [seq_len, k] vals and ids -> gather into [seq_len, k * tp_size]
+        all_vals = [torch.zeros_like(local_topk_vals) for _ in range(tp_size)]
+        all_ids = [torch.zeros_like(local_topk_global_ids) for _ in range(tp_size)]
+        dist.all_gather(all_vals, local_topk_vals, group=process_group)
+        dist.all_gather(all_ids, local_topk_global_ids, group=process_group)
+        all_vals = torch.cat(all_vals, dim=-1)   # [seq_len, k * tp_size]
+        all_ids = torch.cat(all_ids, dim=-1)     # [seq_len, k * tp_size]
+
+        # Step 3: global top-k from the pooled candidates
+        global_topk_vals, sel_idx = all_vals.topk(k, dim=-1)  # [seq_len, k]
+        global_topk_ids = all_ids.gather(dim=-1, index=sel_idx)  # [seq_len, k]
+    else:
+        global_topk_vals = local_topk_vals
+        global_topk_ids = local_topk_global_ids
+
+    # Step 4: compute log softmax for the top-k tokens using vocab_parallel_gather_log_softmax
+    topk_log_probs = vocab_parallel_gather_log_softmax(logits, global_topk_ids, process_group)
+
+    return topk_log_probs, global_topk_ids
+
+
 # from https://github.com/volcengine/verl/blob/0bdf7f469854815177e73dcfe9e420836c952e6e/verl/utils/megatron/tensor_parallel.py#L99
 class _VocabParallelEntropy(torch.autograd.Function):
 

@@ -26,6 +26,21 @@ class Sample:
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
+    teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_logit_y: torch.Tensor | None = None  # Sampled teacher logit for truncation mask computation
+    teacher_sampled_tokens: list[int] | None = None  # Token IDs of teacher-sampled tokens y_t (for RC-OPD)
+    # TopK OPD fields: topk tokens and their log probs from student/teacher
+    rollout_topk_tokens: list[list[int]] | None = None  # TopK tokens from rollout [seq_len, k]
+    rollout_topk_log_probs: list[list[float]] | None = None  # TopK log probs from student [seq_len, k]
+    teacher_topk_log_probs: list[list[float]] | None = None  # Teacher log probs for topk tokens [seq_len, k]
+    teacher_dist_topk_log_probs: list[list[float]] | None = None  # Teacher's own top-k distribution log probs [seq_len, k], sorted by teacher prob; used for confidence reward
+    teacher_dist_topk_tokens: list[list[int]] | None = None  # Teacher's own top-k token ids [seq_len, k], sorted by teacher prob; student sampled token replaces last entry if absent
+    topk_replacement_count: int = 0  # Number of times sampled token was not in topk and needed replacement
+    # Teacher next-token confidence for union topk lookahead
+    # [resp_len], each element is None (skipped position) or list[float] of length K (max P_t for each candidate)
+    teacher_next_token_confidence: list[list[float] | None] | None = None
+    # Candidate token IDs corresponding to confidence values (student's top-K at rollout time)
+    teacher_next_token_candidates: list[list[int] | None] | None = None
 
     class Status(Enum):
         PENDING = "pending"

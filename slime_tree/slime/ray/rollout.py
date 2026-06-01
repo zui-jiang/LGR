@@ -1,6 +1,7 @@
 import itertools
 import logging
 import multiprocessing
+import os
 import random
 import time
 from pathlib import Path
@@ -124,7 +125,7 @@ class RolloutManager:
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
-        return len(self.data_source.dataset) // self.args.rollout_batch_size
+        return len(self.data_source) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
         start_time = time.time()
@@ -387,8 +388,47 @@ class RolloutManager:
         if samples[0].multimodal_train_inputs is not None:
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
-        if "teacher_log_probs" in samples[0].__dict__:
+        if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+
+        if samples[0].teacher_logit_y is not None:
+            train_data["teacher_logit_y"] = [sample.teacher_logit_y for sample in samples]
+
+        if samples[0].teacher_sampled_tokens is not None:
+            train_data["teacher_sampled_tokens"] = [sample.teacher_sampled_tokens for sample in samples]
+
+        # TopK OPD fields
+        if samples[0].rollout_topk_tokens is not None:
+            train_data["rollout_topk_tokens"] = [sample.rollout_topk_tokens for sample in samples]
+
+        if samples[0].rollout_topk_log_probs is not None:
+            train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
+
+        if samples[0].teacher_topk_log_probs is not None:
+            train_data["teacher_topk_log_probs"] = [sample.teacher_topk_log_probs for sample in samples]
+
+        if any(sample.teacher_dist_topk_log_probs is not None for sample in samples):
+            train_data["teacher_dist_topk_log_probs"] = [sample.teacher_dist_topk_log_probs for sample in samples]
+
+        if any(sample.teacher_dist_topk_tokens is not None for sample in samples):
+            train_data["teacher_dist_topk_tokens"] = [sample.teacher_dist_topk_tokens for sample in samples]
+
+        if any(sample.teacher_next_token_confidence is not None for sample in samples):
+            train_data["teacher_next_token_confidence"] = [s.teacher_next_token_confidence for s in samples]
+        if any(sample.teacher_next_token_candidates is not None for sample in samples):
+            train_data["teacher_next_token_candidates"] = [s.teacher_next_token_candidates for s in samples]
+
+        # TopK replacement statistics
+        if hasattr(samples[0], 'topk_replacement_count'):
+            train_data["topk_replacement_counts"] = [
+                getattr(sample, 'topk_replacement_count', 0) for sample in samples
+            ]
+
+        # Student-in-teacher-topk alignment statistics
+        if hasattr(samples[0], 'student_in_teacher_topk_ratio'):
+            train_data["student_in_teacher_topk_stats"] = [
+                getattr(sample, 'student_in_teacher_topk_ratio', None) for sample in samples
+            ]
 
         return train_data
 
@@ -429,6 +469,17 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_logit_y",
+                "teacher_sampled_tokens",
+                "rollout_topk_tokens",
+                "rollout_topk_log_probs",
+                "teacher_topk_log_probs",
+                "teacher_dist_topk_log_probs",
+                "teacher_dist_topk_tokens",
+                "teacher_next_token_confidence",
+                "teacher_next_token_candidates",
+                "topk_replacement_counts",
+                "student_in_teacher_topk_stats",
             ]:
                 if key not in data:
                     continue
@@ -484,14 +535,16 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         )
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-            "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-            "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            key: os.environ.get(key, default_val)
+            for key, default_val in {
+                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+                "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+            }.items()
         }
 
         worker_type = "regular"
@@ -743,6 +796,11 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
     if max(non_generation_time) > 0:
         log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
 
+    # Add RM time statistics
+    rm_times = [getattr(sample, 'rm_time', 0.0) for sample in samples]
+    if max(rm_times) > 0:
+        log_dict |= dict_add_prefix(compute_statistics(rm_times), "rm_time/")
+
     def token_perf(response_lengths, non_generation_time, key=""):
         max_response_length = max(response_lengths)
         if args.rollout_num_gpus:
@@ -775,7 +833,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
 
     def _is_zero_std(samples: list[Sample]):
         rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
+        return isinstance(rewards[0], (int, float)) and (len(rewards) == 0 or all(rewards[0] == r for r in rewards))
 
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]

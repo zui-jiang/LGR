@@ -71,6 +71,12 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
+    # Support resuming from previous run
+    if args.wandb_run_id is not None:
+        init_kwargs["id"] = args.wandb_run_id
+        init_kwargs["resume"] = "allow"
+        logger.info(f"Resuming wandb run with ID: {args.wandb_run_id}")
+
     wandb.init(**init_kwargs)
 
     _init_wandb_common()
