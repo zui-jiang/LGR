@@ -34,3 +34,10 @@ wandb/
 build/
 dist/
 *.egg-info/
+
+# Local experiment assets and virtual environments
+/models/
+/data/
+/datasets/
+/.venv/
+/venv/

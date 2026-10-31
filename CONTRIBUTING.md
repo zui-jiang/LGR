@@ -1,19 +1,18 @@
 # Contributing
 
-Thanks for helping keep this experiment reproducible.
+Please describe the problem, the affected experiment setting, and the validation performed.
 
-## Development Guidelines
+- Keep paths, service endpoints, and credentials in a local `.env`; never commit secrets, weights, datasets, or generated outputs.
+- `slime_tree/` and `sg_tree/` are vendored source trees. Edit them directly and keep upstream licenses and notices intact.
+- Keep changes to training objectives separate from changes to launch infrastructure. Document new experimental settings and their usage.
+- Avoid broad formatting or dependency upgrades across the vendored code.
 
-- Keep machine-specific paths, tokens, and cluster endpoints in `.env`.
-- Keep experiment scripts executable and runnable from the repository root.
-- Document new scripts in `README.md`, including required environment variables.
-- Update submodules with normal git submodule workflows instead of copying vendored code into the root repository.
-
-## Before Opening a Pull Request
+Before proposing a change:
 
 ```bash
-git submodule status
-bash -n scripts/*.sh
+bash -n scripts/train_lgr.sh scripts/exp258-distill-1.5B-v3.sh scripts/models/*.sh
+bash scripts/train_lgr.sh --dry-run
+git diff --check
 ```
 
-If a change touches launch behavior, include the exact command used to validate it and the cluster/runtime assumptions.
+For serving changes, run `sg_tree/test_tree_attention.py` against a teacher using the local SGLang fork. For training changes, report the hardware, dependency versions, launch configuration, and a short training validation. A dry run checks command construction; it does not validate GPU execution or reproduce paper results.
